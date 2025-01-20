@@ -1685,9 +1685,9 @@ std::pair<int, int> SearchWorker::GetRepetitions(int depth,
 // Check if PickNodesToExtendTask should stop picking at this @node.
 bool SearchWorker::ShouldStopPickingHere(Node* node, bool is_root_node,
                                          int repetitions) {
-  constexpr double wl_diff_limit = 0.01f;
-  constexpr float d_diff_limit = 0.01f;
-  constexpr float m_diff_limit = 2.0f;
+  constexpr double wl_diff_limit = 0.001f;
+  constexpr float d_diff_limit = 0.001f;
+  constexpr float m_diff_limit = 0.2f;
 
   if (node->GetN() == 0 || node->IsTerminal()) return true;
 
