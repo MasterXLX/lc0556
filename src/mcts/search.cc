@@ -1686,8 +1686,8 @@ std::pair<int, int> SearchWorker::GetRepetitions(int depth,
 bool SearchWorker::ShouldStopPickingHere(Node* node, bool is_root_node,
                                          int repetitions) {
   constexpr double wl_diff_limit = 0.0001f;
-  constexpr float d_diff_limit = 0.01f;
-  constexpr float m_diff_limit = 2.0f;
+  constexpr float d_diff_limit = 0.0001f;
+  constexpr float m_diff_limit = 0.02f;
 
   if (node->GetN() == 0 || node->IsTerminal()) return true;
 
