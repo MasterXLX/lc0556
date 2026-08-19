@@ -282,10 +282,15 @@ void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
   const auto& board = tree->GetPositionHistory().Last().GetBoard();
   auto legal_moves = board.GenerateLegalMoves();
   
-  // Fix for non-existent CreateEdges method: attach a LowNode with legal_moves if missing
   if (!tree->GetCurrentHead()->GetLowNode()) {
     auto hash = tree->GetHistoryHash(tree->GetPositionHistory());
-    auto* low_node = tree->NonTTAddClone(LowNode(hash, legal_moves));
+    auto [low_node, is_miss] = tree->TTGetOrCreate(hash);
+    if (!low_node->HasChildren() && !legal_moves.empty()) {
+      NNEval eval;
+      eval.num_edges = static_cast<uint8_t>(legal_moves.size());
+      eval.edges = Edge::FromMovelist(legal_moves);
+      low_node->SetNNEval(&eval);
+    }
     tree->GetCurrentHead()->SetLowNode(low_node);
   }
 
