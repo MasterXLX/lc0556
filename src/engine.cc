@@ -31,10 +31,12 @@
 #include <cmath>
 #include <functional>
 
+#include "mcts/node.h"
 #include "mcts/search.h"
 #include "mcts/stoppers/factory.h"
 #include "utils/commandline.h"
 #include "utils/configfile.h"
+#include "utils/fastmath.h"
 #include "utils/logging.h"
 
 namespace lczero {
@@ -67,6 +69,14 @@ const OptionId kStrictUciTiming{"strict-uci-timing", "StrictTiming",
                                 "only then starts timing."};
 const OptionId kPreload{"preload", "",
                         "Initialize backend and load net on engine startup."};
+const OptionId kValueOnly{
+    "value-only", "ValueOnly",
+    "In value only mode all search parameters are ignored and the position is "
+    "evaluated by getting the valuation of every child position and choosing "
+    "the worst for the opponent."};
+const OptionId kPolicyMix{
+    "policy-mix", "PolicyMix",
+    "Amount to mix policy into the value in value-only mode."};
 
 MoveList StringsToMovelist(const std::vector<std::string>& moves,
                            const ChessBoard& board) {
@@ -98,7 +108,7 @@ void EngineController::PopulateOptions(OptionsParser* options) {
       CommandLine::BinaryName().find("simple") != std::string::npos;
   NetworkFactory::PopulateOptions(options);
   options->Add<IntOption>(kThreadsOptionId, 1, 128) = kDefaultThreads;
-  options->Add<IntOption>(kNNCacheSizeId, 0, 999999999) = 2000;
+  options->Add<IntOption>(kNNCacheSizeId, 0, 999999999) = 2000000;
   SearchParams::Populate(options);
 
   ConfigFile::PopulateOptions(options);
@@ -124,6 +134,8 @@ void EngineController::PopulateOptions(OptionsParser* options) {
   options->HideOption(kStrictUciTiming);
 
   options->Add<BoolOption>(kPreload) = false;
+  options->Add<BoolOption>(kValueOnly) = false;
+  options->Add<FloatOption>(kPolicyMix, -2.0f, 2.0f) = 0.0f;
 }
 
 void EngineController::ResetMoveTimer() {
@@ -263,6 +275,100 @@ class PonderResponseTransformer : public TransformingUciResponder {
   std::string ponder_move_;
 };
 
+void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
+                 std::unique_ptr<UciResponder> responder) {
+  auto input_format = network->GetCapabilities().input_format;
+
+  const auto& board = tree->GetPositionHistory().Last().GetBoard();
+  auto legal_moves = board.GenerateLegalMoves();
+  
+  // Fix for non-existent CreateEdges method: attach a LowNode with legal_moves if missing
+  if (!tree->GetCurrentHead()->GetLowNode()) {
+    auto hash = tree->GetHistoryHash(tree->GetPositionHistory());
+    auto* low_node = tree->NonTTAddClone(LowNode(hash, legal_moves));
+    tree->GetCurrentHead()->SetLowNode(low_node);
+  }
+
+  PositionHistory history = tree->GetPositionHistory();
+  std::vector<InputPlanes> planes;
+  int transform;
+  planes.emplace_back(EncodePositionForNN(
+     input_format, history, 8, FillEmptyHistory::FEN_ONLY, &transform));
+  for (auto edge : tree->GetCurrentHead()->Edges()) {
+    history.Append(edge.GetMove());
+    if (history.ComputeGameResult() == GameResult::UNDECIDED) {
+      planes.emplace_back(EncodePositionForNN(
+          input_format, history, 8, FillEmptyHistory::FEN_ONLY, nullptr));
+    }
+    history.Pop();
+  }
+
+  std::vector<float> comp_q;
+  int batch_size = options.Get<int>(SearchParams::kMiniBatchSizeId);
+  if (batch_size == 0) batch_size = network->GetMiniBatchSize();
+  bool policy_done = false;
+  std::vector<float> pol;
+  float max_p = 0.0f;
+  for (size_t i = 0; i < planes.size(); i += batch_size) {
+    auto comp = network->NewComputation();
+    for (int j = 0; j < batch_size; j++) {
+      comp->AddInput(std::move(planes[i + j]));
+      if (i + j + 1 == planes.size()) break;
+    }
+    comp->ComputeBlocking();
+    int start = 0;
+    if (!policy_done) {
+      for (auto edge : tree->GetCurrentHead()->Edges()) {
+        pol.push_back(comp->GetPVal(0, edge.GetMove().as_nn_index(transform)));
+        if (pol.back() > max_p) max_p = pol.back();
+      }
+      start = 1;
+      policy_done = true;
+    }
+    for (int j = start; j < batch_size; j++) comp_q.push_back(comp->GetQVal(j));
+  }
+  float sum=0.0f;
+  for (int i=0; i < pol.size(); i++) {
+    pol[i] = FastExp(pol[i]-max_p)/options.Get<float>(SearchParams::kPolicySoftmaxTempId);
+    sum += pol[i];
+  }
+  Move best;
+  int comp_idx = 0;
+  float max_q = std::numeric_limits<float>::lowest();
+  int polidx=0;
+  for (auto edge : tree->GetCurrentHead()->Edges()) {
+    history.Append(edge.GetMove());
+    auto result = history.ComputeGameResult();
+    float q = -1;
+    if (result == GameResult::UNDECIDED) {
+      // NN eval is for side to move perspective - so if its good, its bad for
+      // us.
+      q = -comp_q[comp_idx];
+      comp_idx++;
+    } else if (result == GameResult::DRAW) {
+      q = 0;
+    } else {
+      // A legal move to a non-drawn terminal without tablebases must be a
+      // win.
+      q = 1;
+    }
+    q += (pol[polidx])/sum*options.Get<float>(kPolicyMix);
+    if (q >= max_q) {
+      max_q = q;
+      best = edge.GetMove(tree->GetPositionHistory().IsBlackToMove());
+    }
+    history.Pop();
+    polidx++;
+  }
+  std::vector<ThinkingInfo> infos;
+  ThinkingInfo thinking;
+  thinking.depth = 1;
+  infos.push_back(thinking);
+  responder->OutputThinkingInfo(&infos);
+  BestMoveInfo info(best);
+  responder->OutputBestMove(&info);
+}
+
 }  // namespace
 
 void EngineController::Go(const GoParams& params) {
@@ -304,10 +410,14 @@ void EngineController::Go(const GoParams& params) {
     // Strip movesleft information from the response.
     responder = std::make_unique<MovesLeftResponseFilter>(std::move(responder));
   }
+  if (options_.Get<bool>(kValueOnly)) {
+    ValueOnlyGo(tree_.get(), network_.get(), options_, std::move(responder));
+    return;
+  }
 
   auto stopper = time_manager_->GetStopper(params, *tree_.get());
   search_ = std::make_unique<Search>(
-      tree_.get(), network_.get(), std::move(responder),
+      *tree_, network_.get(), std::move(responder),
       StringsToMovelist(params.searchmoves, tree_->HeadPosition().GetBoard()),
       *move_start_time_, std::move(stopper), params.infinite, params.ponder,
       options_, &cache_, syzygy_tb_.get());
