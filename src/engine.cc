@@ -19,10 +19,10 @@
 
   If you modify this Program, or any covered work, by linking or
   combining it with NVIDIA Corporation's libraries from the NVIDIA CUDA
-  Toolkit and the NVIDIA CUDA Deep Neural Network library (or a
-  modified version of those libraries), containing parts covered by the
-  terms of the respective license agreement, the licensors of this
-  Program grant you additional permission to convey the resulting work.
+  Toolkit and the NVIDIA cuDNN library (or a modified version of those
+  libraries), containing parts covered by the terms of the respective
+  license agreement, the licensors of this Program grant you additional
+  permission to convey the resulting work.
 */
 
 #include "engine.h"
@@ -96,6 +96,13 @@ MoveList StringsToMovelist(const std::vector<std::string>& moves,
   return result;
 }
 
+inline float ComputeWeight(const SearchParams& params, float uncertainty) {
+  const float minimum = params.GetUncertaintyWeightingMinimum();
+  const float alpha = params.GetUncertaintyWeightingAlpha();
+  const float beta = params.GetUncertaintyWeightingBeta();
+  return fmin(minimum, alpha * pow(uncertainty, beta));
+}
+
 }  // namespace
 
 EngineController::EngineController(std::unique_ptr<UciResponder> uci_responder,
@@ -147,55 +154,22 @@ void EngineController::ResetMoveTimer() {
 // Updates values from Uci options.
 void EngineController::UpdateFromUciOptions() {
   SharedLock lock(busy_mutex_);
-
-  // Syzygy tablebases.
-  std::string tb_paths = options_.Get<std::string>(kSyzygyTablebaseId);
-  if (!tb_paths.empty() && tb_paths != tb_paths_) {
-    syzygy_tb_ = std::make_unique<SyzygyTablebase>();
-    CERR << "Loading Syzygy tablebases from " << tb_paths;
-    if (!syzygy_tb_->init(tb_paths)) {
-      CERR << "Failed to load Syzygy tablebases!";
-      syzygy_tb_ = nullptr;
-    }
-    tb_paths_ = tb_paths;
-  } else if (tb_paths.empty()) {
-    syzygy_tb_ = nullptr;
-    tb_paths_.clear();
+  if (options_.Get<bool>(kValueOnly)) {
+    options_.Set(SearchParams::kCpuctId, 1.0f);
   }
-
-  // Network.
-  const auto network_configuration =
-      NetworkFactory::BackendConfiguration(options_);
-  if (network_configuration_ != network_configuration) {
-    network_ = NetworkFactory::LoadNetwork(options_);
-    network_configuration_ = network_configuration;
-  }
-
-  // Cache size.
-  cache_.SetCapacity(options_.Get<int>(kNNCacheSizeId));
-
-  // Check whether we can update the move timer in "Go".
-  strict_uci_timing_ = options_.Get<bool>(kStrictUciTiming);
+  time_manager_ = MakeTimeManager(options_);
 }
 
-void EngineController::EnsureReady() {
-  std::unique_lock<RpSharedMutex> lock(busy_mutex_);
-  // If a UCI host is waiting for our ready response, we can consider the move
-  // not started until we're done ensuring ready.
-  ResetMoveTimer();
-}
+void EngineController::Go(const GoParams& params) {
+  if (options_.Get<bool>(kValueOnly)) {
+    ValueOnlyGo(tree_.get(), network_.get(), options_,
+                std::move(uci_responder_));
+    return;
+  }
 
-void EngineController::NewGame() {
-  // In case anything relies upon defaulting to default position and just calls
-  // newgame and goes straight into go.
-  ResetMoveTimer();
-  SharedLock lock(busy_mutex_);
-  cache_.Clear();
-  search_.reset();
-  tree_.reset();
-  CreateFreshTimeManager();
-  current_position_ = {ChessBoard::kStartposFen, {}};
-  UpdateFromUciOptions();
+  search_ = std::make_unique<Search>(tree_.get(), network_.get(), options_,
+                                     std::move(uci_responder_), params);
+  search_->StartClock(params);
 }
 
 void EngineController::SetPosition(const std::string& fen,
@@ -382,6 +356,8 @@ void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
   int polidx = 0;
   float max_q = std::numeric_limits<float>::lowest();
 
+  const SearchParams params(options);
+
   for (auto edge : tree->GetCurrentHead()->Edges()) {
     history.Append(edge.GetMove());
 
@@ -393,7 +369,7 @@ void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
       // NN eval is from the side-to-move perspective, so if the child
       // position is good for the opponent, it is bad for us.
       q = -comp_q[comp_idx];
-      q /= comp_uncertainty[comp_idx];
+      q /= ComputeWeight(params, comp_uncertainty[comp_idx]);
       ++comp_idx;
     } else if (result == GameResult::DRAW) {
       q = 0.0f;
@@ -419,140 +395,11 @@ void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
   std::vector<ThinkingInfo> infos;
   ThinkingInfo thinking;
   thinking.depth = 1;
+  thinking.seldepth = 1;
+  thinking.score = max_q;
+  thinking.pv.push_back(best);
   infos.push_back(thinking);
-
-  responder->OutputThinkingInfo(&infos);
-
-  BestMoveInfo info(best);
-  responder->OutputBestMove(&info);
+  responder->SendThinkingInfo(infos);
+  responder->SendBestMove(best);
 }
 
-}  // namespace
-
-void EngineController::Go(const GoParams& params) {
-  // TODO: should consecutive calls to go be considered to be a continuation and
-  // hence have the same start time like this behaves, or should we check start
-  // time hasn't changed since last call to go and capture the new start time
-  // now?
-  if (strict_uci_timing_ || !move_start_time_) ResetMoveTimer();
-  go_params_ = params;
-
-  std::unique_ptr<UciResponder> responder =
-      std::make_unique<NonOwningUciRespondForwarder>(uci_responder_.get());
-
-  // Setting up current position, now that it's known whether it's ponder or
-  // not.
-  if (params.ponder && !current_position_.moves.empty()) {
-    std::vector<std::string> moves(current_position_.moves);
-    std::string ponder_move = moves.back();
-    moves.pop_back();
-    SetupPosition(current_position_.fen, moves);
-    responder = std::make_unique<PonderResponseTransformer>(
-        std::move(responder), ponder_move);
-  } else {
-    SetupPosition(current_position_.fen, current_position_.moves);
-  }
-
-  if (!options_.Get<bool>(kUciChess960)) {
-    // Remap FRC castling to legacy castling.
-    responder = std::make_unique<Chess960Transformer>(
-        std::move(responder), tree_->HeadPosition().GetBoard());
-  }
-
-  if (!options_.Get<bool>(kShowWDL)) {
-    // Strip WDL information from the response.
-    responder = std::make_unique<WDLResponseFilter>(std::move(responder));
-  }
-
-  if (!options_.Get<bool>(kShowMovesleft)) {
-    // Strip movesleft information from the response.
-    responder = std::make_unique<MovesLeftResponseFilter>(std::move(responder));
-  }
-  if (options_.Get<bool>(kValueOnly)) {
-    ValueOnlyGo(tree_.get(), network_.get(), options_, std::move(responder));
-    return;
-  }
-
-  auto stopper = time_manager_->GetStopper(params, *tree_.get());
-  search_ = std::make_unique<Search>(
-    tree_.get(), network_.get(), std::move(responder),
-    StringsToMovelist(params.searchmoves, tree_->HeadPosition().GetBoard()),
-    *move_start_time_, std::move(stopper), params.infinite, params.ponder,
-    options_, &cache_, syzygy_tb_.get());
-
-  LOGFILE << "Timer started at "
-          << FormatTime(SteadyClockToSystemClock(*move_start_time_));
-  search_->StartThreads(options_.Get<int>(kThreadsOptionId));
-}
-
-void EngineController::PonderHit() {
-  ResetMoveTimer();
-  go_params_.ponder = false;
-  Go(go_params_);
-}
-
-void EngineController::Stop() {
-  if (search_) search_->Stop();
-}
-
-EngineLoop::EngineLoop()
-    : engine_(
-          std::make_unique<CallbackUciResponder>(
-              std::bind(&UciLoop::SendBestMove, this, std::placeholders::_1),
-              std::bind(&UciLoop::SendInfo, this, std::placeholders::_1)),
-          options_.GetOptionsDict()) {
-  engine_.PopulateOptions(&options_);
-  options_.Add<StringOption>(kLogFileId);
-}
-
-void EngineLoop::RunLoop() {
-  if (!ConfigFile::Init() || !options_.ProcessAllFlags()) return;
-  const auto options = options_.GetOptionsDict();
-  Logging::Get().SetFilename(options.Get<std::string>(kLogFileId));
-  if (options.Get<bool>(kPreload)) engine_.NewGame();
-  UciLoop::RunLoop();
-}
-
-void EngineLoop::CmdUci() {
-  SendId();
-  for (const auto& option : options_.ListOptionsUci()) {
-    SendResponse(option);
-  }
-  SendResponse("uciok");
-}
-
-void EngineLoop::CmdIsReady() {
-  engine_.EnsureReady();
-  SendResponse("readyok");
-}
-
-void EngineLoop::CmdSetOption(const std::string& name, const std::string& value,
-                              const std::string& context) {
-  options_.SetUciOption(name, value, context);
-  // Set the log filename for the case it was set in UCI option.
-  Logging::Get().SetFilename(
-      options_.GetOptionsDict().Get<std::string>(kLogFileId));
-}
-
-void EngineLoop::CmdUciNewGame() { engine_.NewGame(); }
-
-void EngineLoop::CmdPosition(const std::string& position,
-                             const std::vector<std::string>& moves) {
-  std::string fen = position;
-  if (fen.empty()) {
-    fen = ChessBoard::kStartposFen;
-  }
-  engine_.SetPosition(fen, moves);
-}
-
-void EngineLoop::CmdFen() {
-  std::string fen = GetFen(engine_.ApplyPositionMoves());
-  return SendResponse(fen);
-}
-void EngineLoop::CmdGo(const GoParams& params) { engine_.Go(params); }
-
-void EngineLoop::CmdPonderHit() { engine_.PonderHit(); }
-
-void EngineLoop::CmdStop() { engine_.Stop(); }
-
-}  // namespace lczero
