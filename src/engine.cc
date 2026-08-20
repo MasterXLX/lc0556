@@ -382,6 +382,15 @@ void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
   int polidx = 0;
   float max_q = std::numeric_limits<float>::lowest();
 
+  inline float ComputeWeight(const SearchParams& params, float uncertainty) {
+  const float minimum = params.GetUncertaintyWeightingMinimum();
+  const float alpha = params.GetUncertaintyWeightingAlpha();
+  const float beta = params.GetUncertaintyWeightingBeta();
+  return fmin(minimum, alpha * pow(uncertainty, beta));
+}
+
+  const SearchParams params(options);
+
   for (auto edge : tree->GetCurrentHead()->Edges()) {
     history.Append(edge.GetMove());
 
@@ -393,7 +402,7 @@ void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
       // NN eval is from the side-to-move perspective, so if the child
       // position is good for the opponent, it is bad for us.
       q = -comp_q[comp_idx];
-      q /= comp_uncertainty[comp_idx];
+      q /= ComputeWeight(params, comp_uncertainty[comp_idx]);
       ++comp_idx;
     } else if (result == GameResult::DRAW) {
       q = 0.0f;
