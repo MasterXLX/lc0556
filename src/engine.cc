@@ -398,7 +398,7 @@ void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
       // NN eval is from the side-to-move perspective, so if the child
       // position is good for the opponent, it is bad for us.
       q = -comp_q[comp_idx];
-      q /= min(cap, coefficient * pow(comp_uncertainty[comp_idx], exponent));
+      q /= std::min(cap, coefficient * pow(comp_uncertainty[comp_idx], exponent));
       ++comp_idx;
     } else if (result == GameResult::DRAW) {
       q = 0.0f;
