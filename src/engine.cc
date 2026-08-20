@@ -383,10 +383,11 @@ void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
   float max_q = std::numeric_limits<float>::lowest();
 
   inline float ComputeWeight(const SearchParams& params, float uncertainty) {
-  const float minimum = params.GetUncertaintyWeightingMinimum();
-  const float alpha = params.GetUncertaintyWeightingAlpha();
-  const float beta = params.GetUncertaintyWeightingBeta();
-  return fmin(minimum, alpha * pow(uncertainty, beta));
+  if (!params.GetUseUncertaintyWeighting()) return 1.0f;
+  const float cap = params.GetUncertaintyWeightingCap();
+  const float coefficient = params.GetUncertaintyWeightingCoefficient();
+  const float exponent = params.GetUncertaintyWeightingExponent();
+  return fmin(cap, coefficient * pow(uncertainty, exponent));
 }
 
   const SearchParams params(options);
