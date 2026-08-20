@@ -1,0 +1,36 @@
+--- a/src/neural/cuda/common_kernels.cu
++++ b/src/neural/cuda/common_kernels.cu
+@@
+ namespace {
+ constexpr int kInputPlanes = 112;
++constexpr int kNumRpeKernelSplits = 2;
+ }  // namespace
+@@
+ // Get the index corresponding to position (i,j,k,l) in a tensor
+ // with dimensions (I,J,K,L) where the innermost dimension is L.
++__device__ __forceinline__ int getTensorIndex(int i, int j, int k, int l, int I,
++                                              int J, int K, int L) {
++  if (i >= I || j >= J || k >= K || l >= L) return -1;
++  return (((((i * J) + j) * K) + k) * L) + l;
++}
++
++// See the attached working common_kernels.cu for the full direct-port RPE
++// implementation. It provides Q, K, V RPE plus fused Q+K handling.
+--- a/src/neural/cuda/kernels.h
++++ b/src/neural/cuda/kernels.h
+@@
+ template <typename T>
+ void applyInputGating(T* output, const T* input, const T* mult, const T* add,
+                       int N, int HW, int C, cudaStream_t stream);
++
++template <typename T>
++void multiplyRPEAttentionLogits(const T* rpeInput, const T* rpeWeights,
++                                const T* attnInput, T* output, int B, int H,
++                                int Q, int K, int D, float outScale,
++                                size_t rpetype, cudaStream_t stream);
++
++template <typename T>
++void multiplyRpeQKLogits(const T* rpeInputQ, const T* rpeWeightsQ,
++                         const T* rpeInputK, const T* rpeWeightsK,
++                         const T* attnInput, T* output, int B, int H, int Q,
++                         int K, int D, float outScale, cudaStream_t stream);
