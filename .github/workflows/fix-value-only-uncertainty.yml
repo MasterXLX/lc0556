@@ -1,0 +1,42 @@
+name: Fix ValueOnly uncertainty declaration
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+      - name: Move uncertainty vector declaration
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("src/engine.cc")
+          text = path.read_text()
+          old = """  std::vector<InputPlanes> planes;\n  int transform;\n"""
+          new = """  std::vector<InputPlanes> planes;\n  std::vector<float> comp_uncertainty;\n  int transform;\n"""
+          if old not in text:
+              raise SystemExit("plane declaration block not found")
+          text = text.replace(old, new, 1)
+          old = """  std::vector<float> comp_q;\n  std::vector<float> comp_uncertainty;\n  std::vector<float> pol;\n"""
+          new = """  std::vector<float> comp_q;\n  std::vector<float> pol;\n"""
+          if old not in text:
+              raise SystemExit("late uncertainty declaration not found")
+          text = text.replace(old, new, 1)
+          path.write_text(text)
+      - name: Remove temporary workflow and commit
+        shell: bash
+        run: |
+          rm .github/workflows/fix-value-only-uncertainty.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/engine.cc .github/workflows/fix-value-only-uncertainty.yml
+          git commit -m "Fix uncertainty vector declaration"
+          git push
