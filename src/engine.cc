@@ -311,26 +311,32 @@ void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
   std::vector<float> comp_q;
   int batch_size = options.Get<int>(SearchParams::kMiniBatchSizeId);
   if (batch_size == 0) batch_size = network->GetMiniBatchSize();
-  bool policy_done = false;
-  std::vector<float> pol;
-  float max_p = 0.0f;
-  for (size_t i = 0; i < planes.size(); i += batch_size) {
-    auto comp = network->NewComputation();
-    for (int j = 0; j < batch_size; j++) {
-      comp->AddInput(std::move(planes[i + j]));
-      if (i + j + 1 == planes.size()) break;
+ for (size_t i = 0; i < planes.size(); i += batch_size) {
+  auto comp = network->NewComputation();
+
+  for (int j = 0; j < batch_size && i + j < planes.size(); ++j) {
+    comp->AddInput(std::move(planes[i + j]));
+  }
+
+  comp->ComputeBlocking();
+
+  const int actual_batch_size = comp->GetBatchSize();
+
+  int start = 0;
+  if (!policy_done) {
+    for (auto edge : tree->GetCurrentHead()->Edges()) {
+      pol.push_back(
+          comp->GetPVal(0, edge.GetMove().as_nn_index(transform)));
+      if (pol.back() > max_p) max_p = pol.back();
     }
-    comp->ComputeBlocking();
-    int start = 0;
-    if (!policy_done) {
-      for (auto edge : tree->GetCurrentHead()->Edges()) {
-        pol.push_back(comp->GetPVal(0, edge.GetMove().as_nn_index(transform)));
-        if (pol.back() > max_p) max_p = pol.back();
-      }
-      start = 1;
-      policy_done = true;
-    }
-    for (int j = start; j < batch_size; j++) comp_q.push_back(comp->GetQVal(j));
+    start = 1;
+    policy_done = true;
+  }
+
+  for (int j = start; j < actual_batch_size; ++j) {
+    comp_q.push_back(comp->GetQVal(j));
+  }
+}
   }
   float sum=0.0f;
   for (int i=0; i < pol.size(); i++) {
@@ -422,10 +428,10 @@ void EngineController::Go(const GoParams& params) {
 
   auto stopper = time_manager_->GetStopper(params, *tree_.get());
   search_ = std::make_unique<Search>(
-      *tree_, network_.get(), std::move(responder),
-      StringsToMovelist(params.searchmoves, tree_->HeadPosition().GetBoard()),
-      *move_start_time_, std::move(stopper), params.infinite, params.ponder,
-      options_, &cache_, syzygy_tb_.get());
+    tree_.get(), network_.get(), std::move(responder),
+    StringsToMovelist(params.searchmoves, tree_->HeadPosition().GetBoard()),
+    *move_start_time_, std::move(stopper), params.infinite, params.ponder,
+    options_, &cache_, syzygy_tb_.get());
 
   LOGFILE << "Timer started at "
           << FormatTime(SteadyClockToSystemClock(*move_start_time_));
