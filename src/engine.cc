@@ -314,6 +314,7 @@ void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
     if (history.ComputeGameResult() == GameResult::UNDECIDED) {
       planes.emplace_back(EncodePositionForNN(
           input_format, history, 8, FillEmptyHistory::FEN_ONLY, nullptr));
+      comp_uncertainty.push_back(edge.GetWeight());
     }
 
     history.Pop();
@@ -325,6 +326,7 @@ void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
   }
 
   std::vector<float> comp_q;
+  std::vector<float> comp_uncertainty;
   std::vector<float> pol;
 
   bool policy_done = false;
@@ -391,6 +393,7 @@ void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
       // NN eval is from the side-to-move perspective, so if the child
       // position is good for the opponent, it is bad for us.
       q = -comp_q[comp_idx];
+      q /= comp_uncertainty[comp_idx];
       ++comp_idx;
     } else if (result == GameResult::DRAW) {
       q = 0.0f;
