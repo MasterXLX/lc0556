@@ -29,7 +29,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <functional>
+#include <limits>
 
 #include "mcts/node.h"
 #include "mcts/search.h"
@@ -277,105 +279,147 @@ class PonderResponseTransformer : public TransformingUciResponder {
 
 void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
                  std::unique_ptr<UciResponder> responder) {
-  auto input_format = network->GetCapabilities().input_format;
+  const auto input_format = network->GetCapabilities().input_format;
 
   const auto& board = tree->GetPositionHistory().Last().GetBoard();
-  auto legal_moves = board.GenerateLegalMoves();
-  
+  const auto legal_moves = board.GenerateLegalMoves();
+
   if (!tree->GetCurrentHead()->GetLowNode()) {
-    auto hash = tree->GetHistoryHash(tree->GetPositionHistory());
+    const auto hash = tree->GetHistoryHash(tree->GetPositionHistory());
     auto [low_node, is_miss] = tree->TTGetOrCreate(hash);
+
     if (!low_node->HasChildren() && !legal_moves.empty()) {
       NNEval eval;
       eval.num_edges = static_cast<uint8_t>(legal_moves.size());
       eval.edges = Edge::FromMovelist(legal_moves);
       low_node->SetNNEval(&eval);
     }
+
     tree->GetCurrentHead()->SetLowNode(low_node);
   }
 
   PositionHistory history = tree->GetPositionHistory();
+
   std::vector<InputPlanes> planes;
   int transform;
+
+  // Sample 0 is the current/root position, used for policy.
   planes.emplace_back(EncodePositionForNN(
-     input_format, history, 8, FillEmptyHistory::FEN_ONLY, &transform));
+      input_format, history, 8, FillEmptyHistory::FEN_ONLY, &transform));
+
+  // Samples 1..N are the non-terminal child positions, used for Q.
   for (auto edge : tree->GetCurrentHead()->Edges()) {
     history.Append(edge.GetMove());
+
     if (history.ComputeGameResult() == GameResult::UNDECIDED) {
       planes.emplace_back(EncodePositionForNN(
           input_format, history, 8, FillEmptyHistory::FEN_ONLY, nullptr));
     }
+
     history.Pop();
+  }
+
+  int batch_size = options.Get<int>(SearchParams::kMiniBatchSizeId);
+  if (batch_size == 0) {
+    batch_size = network->GetMiniBatchSize();
   }
 
   std::vector<float> comp_q;
-  int batch_size = options.Get<int>(SearchParams::kMiniBatchSizeId);
-  if (batch_size == 0) batch_size = network->GetMiniBatchSize();
- for (size_t i = 0; i < planes.size(); i += batch_size) {
-  auto comp = network->NewComputation();
+  std::vector<float> pol;
 
-  for (int j = 0; j < batch_size && i + j < planes.size(); ++j) {
-    comp->AddInput(std::move(planes[i + j]));
-  }
+  bool policy_done = false;
+  float max_p = std::numeric_limits<float>::lowest();
 
-  comp->ComputeBlocking();
+  for (size_t i = 0; i < planes.size(); i += batch_size) {
+    auto comp = network->NewComputation();
 
-  const int actual_batch_size = comp->GetBatchSize();
-
-  int start = 0;
-  if (!policy_done) {
-    for (auto edge : tree->GetCurrentHead()->Edges()) {
-      pol.push_back(
-          comp->GetPVal(0, edge.GetMove().as_nn_index(transform)));
-      if (pol.back() > max_p) max_p = pol.back();
+    for (int j = 0; j < batch_size && i + j < planes.size(); ++j) {
+      comp->AddInput(std::move(planes[i + j]));
     }
-    start = 1;
-    policy_done = true;
+
+    comp->ComputeBlocking();
+
+    const int actual_batch_size = comp->GetBatchSize();
+
+    int start = 0;
+
+    // The first NN sample is the root position. Get policy from it once.
+    if (!policy_done) {
+      for (auto edge : tree->GetCurrentHead()->Edges()) {
+        const float p =
+            comp->GetPVal(0, edge.GetMove().as_nn_index(transform));
+
+        pol.push_back(p);
+        if (p > max_p) {
+          max_p = p;
+        }
+      }
+
+      start = 1;
+      policy_done = true;
+    }
+
+    // Remaining samples in this computation are child positions.
+    for (int j = start; j < actual_batch_size; ++j) {
+      comp_q.push_back(comp->GetQVal(j));
+    }
   }
 
-  for (int j = start; j < actual_batch_size; ++j) {
-    comp_q.push_back(comp->GetQVal(j));
-  }
-}
-  }
-  float sum=0.0f;
-  for (int i=0; i < pol.size(); i++) {
-    pol[i] = FastExp(pol[i]-max_p)/options.Get<float>(SearchParams::kPolicySoftmaxTempId);
+  const float policy_temperature =
+      options.Get<float>(SearchParams::kPolicySoftmaxTempId);
+
+  float sum = 0.0f;
+
+  for (size_t i = 0; i < pol.size(); ++i) {
+    pol[i] = FastExp((pol[i] - max_p) / policy_temperature);
     sum += pol[i];
   }
+
   Move best;
   int comp_idx = 0;
+  int polidx = 0;
   float max_q = std::numeric_limits<float>::lowest();
-  int polidx=0;
+
   for (auto edge : tree->GetCurrentHead()->Edges()) {
     history.Append(edge.GetMove());
-    auto result = history.ComputeGameResult();
-    float q = -1;
+
+    const auto result = history.ComputeGameResult();
+
+    float q = -1.0f;
+
     if (result == GameResult::UNDECIDED) {
-      // NN eval is for side to move perspective - so if its good, its bad for
-      // us.
+      // NN eval is from the side-to-move perspective, so if the child
+      // position is good for the opponent, it is bad for us.
       q = -comp_q[comp_idx];
-      comp_idx++;
+      ++comp_idx;
     } else if (result == GameResult::DRAW) {
-      q = 0;
+      q = 0.0f;
     } else {
-      // A legal move to a non-drawn terminal without tablebases must be a
-      // win.
-      q = 1;
+      // A legal move to a non-drawn terminal position without tablebases
+      // must be a win.
+      q = 1.0f;
     }
-    q += (pol[polidx])/sum*options.Get<float>(kPolicyMix);
+
+    q += (pol[polidx] / sum) *
+         options.Get<float>(kPolicyMix);
+
     if (q >= max_q) {
       max_q = q;
-      best = edge.GetMove(tree->GetPositionHistory().IsBlackToMove());
+      best = edge.GetMove(
+          tree->GetPositionHistory().IsBlackToMove());
     }
+
     history.Pop();
-    polidx++;
+    ++polidx;
   }
+
   std::vector<ThinkingInfo> infos;
   ThinkingInfo thinking;
   thinking.depth = 1;
   infos.push_back(thinking);
+
   responder->OutputThinkingInfo(&infos);
+
   BestMoveInfo info(best);
   responder->OutputBestMove(&info);
 }
