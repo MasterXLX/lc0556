@@ -301,6 +301,7 @@ void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
   PositionHistory history = tree->GetPositionHistory();
 
   std::vector<InputPlanes> planes;
+  std::vector<float> comp_uncertainty;
   int transform;
 
   // Sample 0 is the current/root position, used for policy.
@@ -326,7 +327,6 @@ void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
   }
 
   std::vector<float> comp_q;
-  std::vector<float> comp_uncertainty;
   std::vector<float> pol;
 
   bool policy_done = false;
