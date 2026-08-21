@@ -315,7 +315,6 @@ void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
     if (history.ComputeGameResult() == GameResult::UNDECIDED) {
       planes.emplace_back(EncodePositionForNN(
           input_format, history, 8, FillEmptyHistory::FEN_ONLY, nullptr));
-      comp_uncertainty.push_back(edge.GetWeight());
     }
 
     history.Pop();
@@ -364,6 +363,7 @@ void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
     // Remaining samples in this computation are child positions.
     for (int j = start; j < actual_batch_size; ++j) {
       comp_q.push_back(comp->GetQVal(j));
+      comp_uncertainty.push_back(comp->GetEVal(j));
     }
   }
 
@@ -480,10 +480,10 @@ void EngineController::Go(const GoParams& params) {
 
   auto stopper = time_manager_->GetStopper(params, *tree_.get());
   search_ = std::make_unique<Search>(
-    tree_.get(), network_.get(), std::move(responder),
-    StringsToMovelist(params.searchmoves, tree_->HeadPosition().GetBoard()),
-    *move_start_time_, std::move(stopper), params.infinite, params.ponder,
-    options_, &cache_, syzygy_tb_.get());
+      tree_.get(), network_.get(), std::move(responder),
+      StringsToMovelist(params.searchmoves, tree_->HeadPosition().GetBoard()),
+      *move_start_time_, std::move(stopper), params.infinite, params.ponder,
+      options_, &cache_, syzygy_tb_.get());
 
   LOGFILE << "Timer started at "
           << FormatTime(SteadyClockToSystemClock(*move_start_time_));
