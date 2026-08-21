@@ -284,37 +284,33 @@ void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
   const auto& board = tree->GetPositionHistory().Last().GetBoard();
   const auto legal_moves = board.GenerateLegalMoves();
 
-  if (!tree->GetCurrentHead()->GetLowNode()) {
-    const auto hash = tree->GetHistoryHash(tree->GetPositionHistory());
-    auto [low_node, is_miss] = tree->TTGetOrCreate(hash);
-
-    if (!low_node->HasChildren() && !legal_moves.empty()) {
-      NNEval eval;
-      eval.num_edges = static_cast<uint8_t>(legal_moves.size());
-      eval.edges = Edge::FromMovelist(legal_moves);
-      low_node->SetNNEval(&eval);
-    }
-
-    tree->GetCurrentHead()->SetLowNode(low_node);
+  if (legal_moves.empty()) {
+    return;
   }
 
   PositionHistory history = tree->GetPositionHistory();
 
+  // legal_moves is the authoritative move list for this position.
+  // ValueOnly must not use the tree's LowNode/Edges() as a move source.
   std::vector<InputPlanes> planes;
-  std::vector<float> comp_uncertainty;
+  std::vector<int> sample_to_move_index;
+
   int transform;
 
-  // Sample 0 is the current/root position, used for policy.
+  // Sample 0 is the root position and is used to obtain policy.
   planes.emplace_back(EncodePositionForNN(
       input_format, history, 8, FillEmptyHistory::FEN_ONLY, &transform));
+  sample_to_move_index.push_back(-1);
 
-  // Samples 1..N are the non-terminal child positions, used for Q.
-  for (auto edge : tree->GetCurrentHead()->Edges()) {
-    history.Append(edge.GetMove());
+  // Samples 1..N are non-terminal child positions. Keep an explicit
+  // mapping from every NN sample back to its legal move index.
+  for (size_t move_idx = 0; move_idx < legal_moves.size(); ++move_idx) {
+    history.Append(legal_moves[move_idx]);
 
     if (history.ComputeGameResult() == GameResult::UNDECIDED) {
       planes.emplace_back(EncodePositionForNN(
           input_format, history, 8, FillEmptyHistory::FEN_ONLY, nullptr));
+      sample_to_move_index.push_back(static_cast<int>(move_idx));
     }
 
     history.Pop();
@@ -325,45 +321,58 @@ void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
     batch_size = network->GetMiniBatchSize();
   }
 
-  std::vector<float> comp_q;
-  std::vector<float> pol;
+  std::vector<float> q_by_move(legal_moves.size(), 0.0f);
+  std::vector<float> uncertainty_by_move(legal_moves.size(), 0.0f);
+  std::vector<bool> has_nn_value(legal_moves.size(), false);
 
-  bool policy_done = false;
+  std::vector<float> pol(legal_moves.size());
   float max_p = std::numeric_limits<float>::lowest();
 
   for (size_t i = 0; i < planes.size(); i += batch_size) {
     auto comp = network->NewComputation();
 
-    for (int j = 0; j < batch_size && i + j < planes.size(); ++j) {
-      comp->AddInput(std::move(planes[i + j]));
+    const size_t end = std::min(
+        i + static_cast<size_t>(batch_size), planes.size());
+
+    for (size_t j = i; j < end; ++j) {
+      comp->AddInput(std::move(planes[j]));
     }
 
     comp->ComputeBlocking();
 
     const int actual_batch_size = comp->GetBatchSize();
 
-    int start = 0;
-
-    // The first NN sample is the root position. Get policy from it once.
-    if (!policy_done) {
-      for (auto edge : tree->GetCurrentHead()->Edges()) {
+    // Sample 0 is always the root position. It is only used for policy.
+    if (i == 0) {
+      for (size_t move_idx = 0; move_idx < legal_moves.size();
+           ++move_idx) {
         const float p =
-            comp->GetPVal(0, edge.GetMove().as_nn_index(transform));
+            comp->GetPVal(0, legal_moves[move_idx].as_nn_index(transform));
 
-        pol.push_back(p);
-        if (p > max_p) {
-          max_p = p;
-        }
+        pol[move_idx] = p;
+        max_p = std::max(max_p, p);
       }
-
-      start = 1;
-      policy_done = true;
     }
 
-    // Remaining samples in this computation are child positions.
-    for (int j = start; j < actual_batch_size; ++j) {
-      comp_q.push_back(comp->GetQVal(j));
-      comp_uncertainty.push_back(comp->GetEVal(j));
+    // Explicitly associate each NN result with its legal move rather than
+    // relying on a separate comp_idx that can drift from the edge list.
+    for (int j = 0; j < actual_batch_size; ++j) {
+      const size_t sample_idx = i + static_cast<size_t>(j);
+
+      if (sample_idx == 0) {
+        continue;
+      }
+
+      const int move_idx = sample_to_move_index[sample_idx];
+
+      if (move_idx < 0 ||
+          static_cast<size_t>(move_idx) >= legal_moves.size()) {
+        continue;
+      }
+
+      q_by_move[move_idx] = comp->GetQVal(j);
+      uncertainty_by_move[move_idx] = comp->GetEVal(j);
+      has_nn_value[move_idx] = true;
     }
   }
 
@@ -372,53 +381,72 @@ void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
 
   float sum = 0.0f;
 
-  for (size_t i = 0; i < pol.size(); ++i) {
-    pol[i] = FastExp((pol[i] - max_p) / policy_temperature);
-    sum += pol[i];
+  for (float& p : pol) {
+    p = FastExp((p - max_p) / policy_temperature);
+    sum += p;
   }
-
-  Move best;
-  int comp_idx = 0;
-  int polidx = 0;
-  float max_q = std::numeric_limits<float>::lowest();
 
   const SearchParams params(options);
   const float cap = params.GetUncertaintyWeightingCap();
-  const float coefficient = params.GetUncertaintyWeightingCoefficient();
+  const float coefficient =
+      params.GetUncertaintyWeightingCoefficient();
   const float exponent = params.GetUncertaintyWeightingExponent();
 
-  for (auto edge : tree->GetCurrentHead()->Edges()) {
-    history.Append(edge.GetMove());
+  const bool root_is_black =
+      tree->GetPositionHistory().IsBlackToMove();
+
+  Move best;
+  float max_q = std::numeric_limits<float>::lowest();
+
+  // Iterate ONLY over legal_moves. No tree edges are consulted here.
+  for (size_t move_idx = 0; move_idx < legal_moves.size(); ++move_idx) {
+    history.Append(legal_moves[move_idx]);
 
     const auto result = history.ComputeGameResult();
 
-    float q = -1.0f;
+    float q;
 
     if (result == GameResult::UNDECIDED) {
-      // NN eval is from the side-to-move perspective, so if the child
-      // position is good for the opponent, it is bad for us.
-      q = -comp_q[comp_idx];
-      q /= coefficient * comp_uncertainty[comp_idx] + 1 - coefficient / 2;
-      ++comp_idx;
+      // NN evaluation is from the child side-to-move perspective, so
+      // negate it to obtain the value from the root side's perspective.
+      q = -q_by_move[move_idx];
+
+      const float uncertainty = uncertainty_by_move[move_idx];
+
+      q /= uncertainty * coefficient + 1 - coefficient / 2;
     } else if (result == GameResult::DRAW) {
       q = 0.0f;
     } else {
-      // A legal move to a non-drawn terminal position without tablebases
-      // must be a win.
-      q = 1.0f;
+      // Convert the terminal result to the root player's perspective.
+      const bool root_won =
+          root_is_black ? (result == GameResult::BLACK_WON)
+                        : (result == GameResult::WHITE_WON);
+
+      q = root_won ? 1.0f : -1.0f;
     }
 
-    q += (pol[polidx] / sum) *
-         options.Get<float>(kPolicyMix);
+    if (sum > 0.0f) {
+      q += (pol[move_idx] / sum) *
+           options.Get<float>(kPolicyMix);
+    }
 
     if (q >= max_q) {
       max_q = q;
-      best = edge.GetMove(
-          tree->GetPositionHistory().IsBlackToMove());
+      best = legal_moves[move_idx];
     }
 
     history.Pop();
-    ++polidx;
+  }
+
+  // Belt-and-suspenders check: best must have originated from the
+  // authoritative legal move list.
+  const bool best_is_legal =
+      std::find(legal_moves.begin(), legal_moves.end(), best) !=
+      legal_moves.end();
+
+  if (!best_is_legal) {
+    LOGERR << "ValueOnlyGo selected an illegal move.";
+    return;
   }
 
   std::vector<ThinkingInfo> infos;
@@ -428,11 +456,10 @@ void ValueOnlyGo(NodeTree* tree, Network* network, const OptionsDict& options,
 
   responder->OutputThinkingInfo(&infos);
 
-  BestMoveInfo info(best);
+  BestMoveInfo info(
+      best, tree->GetPositionHistory().IsBlackToMove());
   responder->OutputBestMove(&info);
 }
-
-}  // namespace
 
 void EngineController::Go(const GoParams& params) {
   // TODO: should consecutive calls to go be considered to be a continuation and
